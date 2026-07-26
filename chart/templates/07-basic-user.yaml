@@ -39,6 +39,10 @@ metadata:
     {{- include "child-sso.labels" . | nindent 4 }}
 spec:
   displayName: {{ $user | title }}
+  # 0.1.5: avatarURL is a REQUIRED field on basic.authn.krateo.io/User — omitting it
+  # fails admission ("spec.avatarURL: Required value") so the User never lands (while the
+  # password Secret does), and portal login as demoUser 404s.
+  avatarURL: {{ .Values.demoUserAvatarURL | default "https://www.gravatar.com/avatar/?d=identicon" | quote }}
   groups:
     - admins
     - devs
