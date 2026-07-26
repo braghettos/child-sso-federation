@@ -106,8 +106,15 @@ else
     -d '{"identity_provider":{"enabled":true,"domain_id":"'"$DID"'","description":"Keycloak (krateo realm) OIDC identity provider","remote_ids":["'"$ISSUER"'"]}}' >/dev/null
 fi
 
-echo "[keystone-federation] PUT mapping keycloak_mapping"
-curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PUT "$KS/OS-FEDERATION/mappings/keycloak_mapping" -d @/manifests/mapping.json >/dev/null
+echo "[keystone-federation] ensure mapping keycloak_mapping"
+# 0.1.3: Keystone PUT mappings is CREATE-ONLY — a blind PUT on an existing mapping returns
+# 409 and fails the Job on any retry/re-run (the IdP + protocol calls were already
+# GET-or-PUT/PATCH; the mapping was the straggler). GET-then-PATCH-else-PUT = idempotent.
+if curl -fsS -o /dev/null -H "$AUTH" "$KS/OS-FEDERATION/mappings/keycloak_mapping" 2>/dev/null; then
+  curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PATCH "$KS/OS-FEDERATION/mappings/keycloak_mapping" -d @/manifests/mapping.json >/dev/null
+else
+  curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PUT "$KS/OS-FEDERATION/mappings/keycloak_mapping" -d @/manifests/mapping.json >/dev/null
+fi
 
 echo "[keystone-federation] ensure protocol openid bound to mapping"
 if curl -fsS -o /dev/null -H "$AUTH" "$KS/OS-FEDERATION/identity_providers/keycloak/protocols/openid" 2>/dev/null; then
