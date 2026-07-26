@@ -24,12 +24,17 @@ def get(path):
     if s >= 300: raise SystemExit(f"GET {path} -> {s} {b}")
     return b
 
-# --- 0. delete existing browser-mfa flow if present ---
+# --- 0. idempotent reuse. 0.1.4: a re-run must NOT delete+recreate the flow — it's
+#     bound CLIENT-level to the `kubernetes` client, so DELETE 500s and the subsequent
+#     create 409s -> the Job fails on every CDC re-run and the composition never
+#     converges. The full ladder is built on the first successful run, so if the flow
+#     already exists just emit its id and exit 0 (reuse). ---
 flows = get("/authentication/flows")
-for f in flows:
-    if f["alias"] == "browser-mfa":
-        s,b,_ = call("DELETE", f"/authentication/flows/{f['id']}")
-        print(f"deleted existing browser-mfa flow -> {s}")
+existing = [f for f in flows if f["alias"] == "browser-mfa"]
+if existing:
+    print("BROWSER_MFA_FLOW_ID=" + existing[0]["id"])
+    print("browser-mfa flow already exists -> reusing (idempotent)")
+    sys.exit(0)
 
 # --- 1. create top-level flow ---
 s,b,_ = call("POST", "/authentication/flows", {
