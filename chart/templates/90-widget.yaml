@@ -1,0 +1,29 @@
+{{- if .Values.widget.enabled }}
+# W7 — the payoff widget. The OIDC (Keycloak) path is fully silent: a user who
+# logged into the portal via Keycloak holds an SSO session, so the Keystone WebSSO
+# deep-link lands them in Horizon already authenticated.
+#
+# CAVEAT (task C dependency): the basic-auth path via the token-bridge is
+# BEARER-ONLY — a plain Markdown link cannot carry the Authorization: Bearer JWT.
+# Productizing the basic-auth link needs the frontend to do an authenticated fetch
+# (or same-origin serving of the bridge). Until task C lands, the OIDC deep-link
+# below is the working zero-click path; the bridge link is included for basic-auth
+# users but requires the task-C JWT-carrying widget to actually authenticate.
+apiVersion: widgets.templates.krateo.io/v1beta1
+kind: Markdown
+metadata:
+  name: openstack-sso-link
+  namespace: {{ include "child-sso.namespace" . }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  widgetData:
+    markdown: |
+      ## OpenStack
+
+      Your OpenStack tenant, single sign-on — no second login.
+
+      [🚀 Open Horizon (SSO)](https://{{ include "child-sso.host.keystone" . }}/v3/auth/OS-FEDERATION/websso/openid?origin=https://{{ include "child-sso.host.horizon" . }}/auth/websso/)
+
+      > Opens the OpenStack dashboard using your existing Krateo / Keycloak session.
+{{- end }}

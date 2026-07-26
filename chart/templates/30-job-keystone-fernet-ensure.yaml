@@ -1,0 +1,117 @@
+{{- if .Values.keystone.fernetEnsure.enabled }}
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-keystone-fernet" }}
+# W6 — keystone-fernet-ensure: keystone's fernet-keys Secret can come up EMPTY on a
+# fresh install (a keystone helm re-render wipes it while credential-keys survive)
+# -> Keystone issues token 500s (KeysNotFound) and every downstream federation +
+# bridge call fails. This Job waits for the Secret to exist, and IF it has zero data
+# entries, regenerates a fresh primary+secondary Fernet key (urlsafe-base64 of 32
+# random bytes, the cryptography.fernet key format) and rolls keystone-api to reload
+# it. Fully idempotent: a no-op once the keyset is populated (never rotates a live
+# keyset).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+---
+{{- $script := printf `set -eu
+NS="%s"
+echo "[fernet-ensure] inspecting keystone-fernet-keys Secret"
+CNT=$(kubectl -n "$NS" get secret keystone-fernet-keys -o json 2>/dev/null | jq -r '.data | length' 2>/dev/null || echo 0)
+CNT=${CNT:-0}
+echo "[fernet-ensure] keystone-fernet-keys data entries: $CNT"
+if [ "$CNT" -gt 0 ]; then
+  echo "[fernet-ensure] fernet keyset present -> nothing to do (idempotent)"
+  exit 0
+fi
+echo "[fernet-ensure] EMPTY fernet keyset -> regenerating a fresh primary+secondary key"
+gen_key() { head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '\n'; }
+K0=$(gen_key); K1=$(gen_key)
+D0=$(printf '%%s' "$K0" | base64 | tr -d '\n')
+D1=$(printf '%%s' "$K1" | base64 | tr -d '\n')
+kubectl -n "$NS" patch secret keystone-fernet-keys --type=merge \
+  -p "{\"data\":{\"0\":\"$D0\",\"1\":\"$D1\"}}"
+echo "[fernet-ensure] rolling keystone-api to reload the new fernet keyset"
+kubectl -n "$NS" rollout restart deploy/keystone-api || true
+kubectl -n "$NS" rollout status deploy/keystone-api --timeout=300s || true
+echo "[fernet-ensure] done"
+` $ns }}
+{{- $suffix := ($script | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  run.sh: |-
+{{ $script | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "kubectl -n %s get secret keystone-fernet-keys" $ns) "msg" "keystone-fernet-keys Secret exists (keystone deployed)" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.tools | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}
+{{- end }}

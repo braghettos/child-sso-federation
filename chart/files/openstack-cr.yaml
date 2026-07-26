@@ -1,0 +1,84 @@
+# FINAL federation componentValues, baked at CR creation (applied ONCE, never
+# re-patched -> dodges the fernet churn + umbrella Horizon-prune deadlock).
+# The OSH helm-toolkit {{ ... }} in wsgi_keystone is INTENTIONALLY preserved as
+# a literal (this file is loaded via .Files.Get + string-replace, not templated).
+apiVersion: __APIVERSION__
+kind: Openstack
+metadata:
+  name: openstack
+  namespace: __NAMESPACE__
+spec:
+  profile: __PROFILE__
+  componentValues:
+    keystone:
+      images:
+        tags:
+          keystone_api: __KEYSTONE_IMAGE__
+      conf:
+        keystone:
+          auth:
+            methods: password,token,openid
+          openid:
+            remote_id_attribute: HTTP_OIDC_ISS
+          federation:
+            trusted_dashboard:
+              - "https://__HORIZON_HOST__/auth/websso/"
+            sso_callback_template: /etc/keystone/sso_callback_template.html
+          auto_provisioning:
+            enabled: true
+        software:
+          apache2:
+            a2enmod:
+              - auth_openidc
+        wsgi_keystone: |
+          {{- $portInt := tuple "identity" "service" "api" $ | include "helm-toolkit.endpoints.endpoint_port_lookup" }}
+          Listen 0.0.0.0:{{ $portInt }}
+          ErrorLog /dev/stdout
+          CustomLog /dev/stdout combined
+          LoadModule auth_openidc_module /usr/lib/apache2/modules/mod_auth_openidc.so
+          OIDCClaimPrefix "OIDC-"
+          OIDCClaimDelimiter ";"
+          OIDCXForwardedHeaders "X-Forwarded-Proto"
+          OIDCResponseType "code"
+          OIDCScope "openid email profile"
+          OIDCProviderMetadataURL https://__KEYCLOAK_HOST__/realms/__REALM__/.well-known/openid-configuration
+          OIDCClientID keystone
+          OIDCClientSecret __KEYSTONE_CLIENT_SECRET__
+          OIDCCryptoPassphrase __OIDC_CRYPTO_PASSPHRASE__
+          OIDCRedirectURI https://__KEYSTONE_HOST__/v3/auth/OS-FEDERATION/identity_providers/keycloak/protocols/openid/redirect_uri
+          <VirtualHost *:{{ $portInt }}>
+            WSGIDaemonProcess keystone-public processes=1 threads=1 user=keystone group=keystone display-name=%{GROUP}
+            WSGIProcessGroup keystone-public
+            WSGIScriptAlias / /var/www/cgi-bin/keystone/wsgi.py
+            WSGIApplicationGroup %{GLOBAL}
+            WSGIPassAuthorization On
+            ErrorLog /dev/stdout
+            CustomLog /dev/stdout combined
+            <Location ~ "/v3/auth/OS-FEDERATION/identity_providers/keycloak/protocols/openid/websso">
+              Require valid-user
+              AuthType openid-connect
+            </Location>
+            <Location ~ "/v3/auth/OS-FEDERATION/websso/openid">
+              Require valid-user
+              AuthType openid-connect
+            </Location>
+            <Location ~ "/v3/auth/OS-FEDERATION/identity_providers/keycloak/protocols/openid/redirect_uri">
+              Require valid-user
+              AuthType openid-connect
+            </Location>
+          </VirtualHost>
+    horizon:
+      conf:
+        horizon:
+          local_settings:
+            config:
+              auth:
+                sso:
+                  enabled: true
+                  initial_choice: "openid"
+                  websso_keystone_url: "https://__KEYSTONE_HOST__/v3"
+                idp_mapping:
+                  - name: openid
+                    label: "Login with Keycloak"
+                    idp: keycloak
+                    protocol: openid

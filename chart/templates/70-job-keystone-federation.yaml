@@ -1,0 +1,169 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-keystone-federation" }}
+{{- $ks := .Values.inCluster.keystoneAuthUrl }}
+{{- $issuer := include "child-sso.issuer" . }}
+{{- $domain := .Values.openstack.domain }}
+{{- $project := .Values.openstack.demoProject }}
+{{- $adminSecret := .Values.keystone.adminSecret }}
+{{- $k := .Values.keystone.keys }}
+# W6 — keystone-federation: create the keystone-clouds/keystone-token Secrets (for
+# the KOG auth-bridge), then set up OS-FEDERATION via the Keystone REST API with an
+# admin token (GET-or-create domain/project, PUT IdP/mapping/protocol). Idempotent.
+# NOTE: implemented via REST (not KOG CRs) because the published keystone KOG 0.1.0
+# does not ship FederationProvider/Mapping/Protocol RestDefinitions.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+---
+{{- $mapping := printf `{"mapping":{"rules":[{"local":[{"user":{"name":"{0}","email":"{1}","domain":{"name":"%s"}}},{"projects":[{"name":"%s","roles":[{"name":"member"}]}]}],"remote":[{"type":"OIDC-preferred_username"},{"type":"OIDC-email"}]}]}}` $domain $project }}
+{{- $script := printf `set -eu
+NS="%[1]s"
+KS="%[2]s"
+ISSUER="%[3]s"
+DOMAIN="%[4]s"
+PROJECT="%[5]s"
+ADMIN_SECRET="%[6]s"
+get() { kubectl -n "$NS" get secret "$ADMIN_SECRET" -o jsonpath="{.data.$1}" 2>/dev/null | base64 -d || true; }
+OS_USER=$(get %[7]s); OS_USER=${OS_USER:-admin}
+OS_PASS=$(get %[8]s)
+OS_PROJ=$(get %[9]s); OS_PROJ=${OS_PROJ:-admin}
+OS_UDOM=$(get %[10]s); OS_UDOM=${OS_UDOM:-Default}
+OS_PDOM=$(get %[11]s); OS_PDOM=${OS_PDOM:-Default}
+[ -n "$OS_PASS" ] || { echo "no admin password in $ADMIN_SECRET" >&2; exit 1; }
+
+echo "[keystone-federation] writing keystone-clouds + keystone-token (for the KOG auth-bridge)"
+CLOUDS=$(printf 'clouds:\n  openstack:\n    auth:\n      auth_url: %%s\n      username: %%s\n      password: "%%s"\n      project_name: %%s\n      user_domain_name: %%s\n      project_domain_name: %%s\n    region_name: RegionOne\n' "$KS" "$OS_USER" "$OS_PASS" "$OS_PROJ" "$OS_UDOM" "$OS_PDOM")
+printf '%%s' "$CLOUDS" > /tmp/clouds.yaml
+kubectl -n "$NS" create secret generic keystone-clouds --from-file=clouds.yaml=/tmp/clouds.yaml --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$NS" create secret generic keystone-token --from-literal=token=proxy-injects-real-token --dry-run=client -o yaml | kubectl apply -f -
+
+echo "[keystone-federation] obtaining admin token"
+REQ='{"auth":{"identity":{"methods":["password"],"password":{"user":{"name":"'"$OS_USER"'","domain":{"name":"'"$OS_UDOM"'"},"password":"'"$OS_PASS"'"}}},"scope":{"project":{"name":"'"$OS_PROJ"'","domain":{"name":"'"$OS_PDOM"'"}}}}}'
+TOKEN=$(curl -fsS --retry 5 --retry-connrefused --retry-delay 3 -D - -o /dev/null -X POST "$KS/auth/tokens" -H 'Content-Type: application/json' -d "$REQ" | tr -d '\r' | awk 'tolower($1)=="x-subject-token:"{print $2}')
+[ -n "$TOKEN" ] || { echo "no admin token" >&2; exit 1; }
+AUTH="X-Auth-Token: $TOKEN"
+
+echo "[keystone-federation] GET-or-create domain $DOMAIN"
+DID=$(curl -fsS -H "$AUTH" "$KS/domains?name=$DOMAIN" | jq -r '.domains[0].id // empty')
+if [ -z "$DID" ]; then
+  DID=$(curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X POST "$KS/domains" -d '{"domain":{"name":"'"$DOMAIN"'","enabled":true,"description":"Keycloak federation domain"}}' | jq -r .domain.id)
+fi
+echo "[keystone-federation] domain id=$DID"
+
+echo "[keystone-federation] GET-or-create project $PROJECT in $DOMAIN"
+PID=$(curl -fsS -H "$AUTH" "$KS/projects?name=$PROJECT&domain_id=$DID" | jq -r '.projects[0].id // empty')
+if [ -z "$PID" ]; then
+  PID=$(curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X POST "$KS/projects" -d '{"project":{"name":"'"$PROJECT"'","domain_id":"'"$DID"'","enabled":true}}' | jq -r .project.id)
+fi
+echo "[keystone-federation] project id=$PID"
+
+echo "[keystone-federation] GET-or-create identity provider keycloak (remote_ids=[$ISSUER])"
+# IdP is create-only: a blind PUT on an existing IdP returns 409 and fails the Job
+# even though the IdP/mapping/protocol are correctly present. GET-or-skip instead.
+if curl -fsS -o /dev/null -H "$AUTH" "$KS/OS-FEDERATION/identity_providers/keycloak" 2>/dev/null; then
+  echo "[keystone-federation] IdP keycloak already exists — leaving it untouched (409-safe)"
+else
+  curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PUT "$KS/OS-FEDERATION/identity_providers/keycloak" \
+    -d '{"identity_provider":{"enabled":true,"domain_id":"'"$DID"'","description":"Keycloak (krateo realm) OIDC identity provider","remote_ids":["'"$ISSUER"'"]}}' >/dev/null
+fi
+
+echo "[keystone-federation] PUT mapping keycloak_mapping"
+curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PUT "$KS/OS-FEDERATION/mappings/keycloak_mapping" -d @/manifests/mapping.json >/dev/null
+
+echo "[keystone-federation] ensure protocol openid bound to mapping"
+if curl -fsS -o /dev/null -H "$AUTH" "$KS/OS-FEDERATION/identity_providers/keycloak/protocols/openid" 2>/dev/null; then
+  curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PATCH "$KS/OS-FEDERATION/identity_providers/keycloak/protocols/openid" -d '{"protocol":{"mapping_id":"keycloak_mapping"}}' >/dev/null
+else
+  curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X PUT "$KS/OS-FEDERATION/identity_providers/keycloak/protocols/openid" -d '{"protocol":{"mapping_id":"keycloak_mapping"}}' >/dev/null
+fi
+echo "[keystone-federation] done"
+` $ns $ks $issuer $domain $project $adminSecret $k.username $k.password $k.projectName $k.userDomainName $k.projectDomainName }}
+{{- $suffix := (printf "%s%s" $mapping $script | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  mapping.json: |-
+{{ $mapping | indent 4 }}
+  run.sh: |-
+{{ $script | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "{ curl -fsS -o /dev/null %s && kubectl -n %s get deploy keystone-api -o jsonpath='{.spec.template.spec.containers[*].image}' 2>/dev/null | grep -q keystone-oidc; }" $ks $ns) "msg" "keystone /v3 up + keystone-api running the OIDC image" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.tools | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: manifests
+              mountPath: /manifests
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: run.sh
+                path: run.sh
+        - name: manifests
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: mapping.json
+                path: mapping.json

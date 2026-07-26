@@ -1,0 +1,29 @@
+apiVersion: v2
+name: child-sso-federation
+description: >-
+  Brings a fresh Krateo child up fully SSO-federated with OpenStack (Keycloak
+  IdP + Keystone OIDC federation + Horizon WebSSO + basic-auth token-bridge)
+  with zero manual steps. Templatized per-tenant; idempotent, declarative,
+  wave-sequenced via plain bootstrap Jobs (NO helm hooks). Deployed inside the
+  child vcluster (namespace krateo-system) as an additional vcluster.helm entry.
+type: application
+version: CHART_VERSION
+appVersion: CHART_VERSION
+keywords:
+  - krateo
+  - sso
+  - keycloak
+  - keystone
+  - openstack
+  - federation
+home: https://github.com/braghettos/child-sso-federation
+sources:
+  - https://github.com/braghettos/child-sso-federation
+maintainers:
+  - name: braghettos
+icon: https://raw.githubusercontent.com/krateoplatformops/krateo/main/docs/media/logo.svg
+annotations:
+  krateo.io/category: security
+  krateo.io/display-name: Child SSO Federation
+  krateo.io/maturity: beta
+  krateoSupportedVersion: ">= 2.5.1"

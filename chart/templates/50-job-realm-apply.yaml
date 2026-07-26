@@ -1,0 +1,220 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-realm-apply" }}
+{{- $kc := .Values.inCluster.keycloakBaseUrl }}
+{{- $realm := .Values.realm }}
+{{- $portal := include "child-sso.host.portal" . }}
+{{- $keystone := include "child-sso.host.keystone" . }}
+{{- $ksSecret := include "child-sso.keystoneClientSecret" . }}
+# W4 — realm-apply: Configuration CRs + KeycloakRealm + mapper-less KeycloakClients
+# (krateo-authn, keystone). Then read the krateo-authn client secret back into the
+# krateo-authn-client Secret (idempotent, GET-before-create).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["keycloak.ogen.krateo.io"]
+    resources: ["keycloakrealms", "keycloakclients", "keycloakrealmconfigurations", "keycloakclientconfigurations"]
+    verbs: ["get", "list", "create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+---
+{{- $manifests := printf `apiVersion: keycloak.ogen.krateo.io/v1alpha1
+kind: KeycloakRealmConfiguration
+metadata:
+  name: keycloak-admin
+  namespace: %[1]s
+spec:
+  authentication:
+    bearer:
+      tokenRef:
+        name: keycloak-admin-token
+        namespace: %[1]s
+        key: token
+---
+apiVersion: keycloak.ogen.krateo.io/v1alpha1
+kind: KeycloakClientConfiguration
+metadata:
+  name: keycloak-admin
+  namespace: %[1]s
+spec:
+  authentication:
+    bearer:
+      tokenRef:
+        name: keycloak-admin-token
+        namespace: %[1]s
+        key: token
+---
+apiVersion: keycloak.ogen.krateo.io/v1alpha1
+kind: KeycloakRealm
+metadata:
+  name: %[2]s
+  namespace: %[1]s
+spec:
+  configurationRef:
+    name: keycloak-admin
+    namespace: %[1]s
+  realm: %[2]s
+  enabled: true
+  displayName: "Krateo PlatformOps"
+  loginWithEmailAllowed: true
+  sslRequired: external
+  ssoSessionIdleTimeout: 1800
+  ssoSessionMaxLifespan: 36000
+---
+apiVersion: keycloak.ogen.krateo.io/v1alpha1
+kind: KeycloakClient
+metadata:
+  name: krateo-authn
+  namespace: %[1]s
+spec:
+  configurationRef:
+    name: keycloak-admin
+    namespace: %[1]s
+  realm: %[2]s
+  clientId: krateo-authn
+  name: "Krateo AuthN"
+  enabled: true
+  protocol: openid-connect
+  publicClient: false
+  standardFlowEnabled: true
+  clientAuthenticatorType: client-secret
+  redirectUris:
+    - "https://%[3]s/auth/oidc"
+  webOrigins:
+    - "https://%[3]s"
+---
+apiVersion: keycloak.ogen.krateo.io/v1alpha1
+kind: KeycloakClient
+metadata:
+  name: keystone
+  namespace: %[1]s
+spec:
+  configurationRef:
+    name: keycloak-admin
+    namespace: %[1]s
+  realm: %[2]s
+  clientId: keystone
+  name: "OpenStack Keystone (Horizon WebSSO)"
+  enabled: true
+  protocol: openid-connect
+  publicClient: false
+  standardFlowEnabled: true
+  clientAuthenticatorType: client-secret
+  secret: "%[5]s"
+  redirectUris:
+    - "https://%[4]s/v3/auth/OS-FEDERATION/identity_providers/keycloak/protocols/openid/redirect_uri"
+    - "https://%[4]s/v3/auth/OS-FEDERATION/identity_providers/keycloak/protocols/openid/websso"
+    - "https://%[4]s/redirect_uri"
+  webOrigins:
+    - "https://%[4]s"
+` $ns $realm $portal $keystone $ksSecret }}
+{{- $script := printf `set -eu
+KC="%s"
+NS="%s"
+REALM="%s"
+echo "[realm-apply] applying Configuration + Realm + mapper-less Clients (SSA)"
+kubectl apply --server-side --force-conflicts -f /manifests/realm.yaml
+echo "[realm-apply] waiting for krateo-authn client to reconcile into the realm"
+TOKEN=""
+for i in $(seq 1 60); do
+  TOKEN=$(kubectl -n "$NS" get secret keycloak-admin-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+  if [ -n "$TOKEN" ]; then
+    UUID=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$KC/admin/realms/$REALM/clients?clientId=krateo-authn" | jq -r '.[0].id // empty' || true)
+    if [ -n "$UUID" ]; then break; fi
+  fi
+  echo "[realm-apply] krateo-authn not reconciled yet; retry $i"; sleep 5
+done
+[ -n "$UUID" ] || { echo "krateo-authn client not found after wait" >&2; exit 1; }
+CS=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$KC/admin/realms/$REALM/clients/$UUID/client-secret" | jq -r .value)
+[ -n "$CS" ] && [ "$CS" != null ] || { echo "no krateo-authn secret" >&2; exit 1; }
+echo "[realm-apply] krateo-authn client secret length=${#CS}"
+kubectl -n "$NS" create secret generic krateo-authn-client \
+  --from-literal=clientSecret="$CS" --dry-run=client -o yaml | kubectl apply -f -
+echo "[realm-apply] done"
+` $kc $ns $realm }}
+{{- $suffix := (printf "%s%s" $manifests $script | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  realm.yaml: |-
+{{ $manifests | indent 4 }}
+  run.sh: |-
+{{ $script | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "{ kubectl get crd keycloakclients.keycloak.ogen.krateo.io >/dev/null 2>&1 && [ -n \"$(kubectl -n %s get secret keycloak-admin-token -o jsonpath='{.data.token}' 2>/dev/null)\" ]; }" $ns) "msg" "KeycloakClient CRD + keycloak-admin-token populated" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.tools | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: manifests
+              mountPath: /manifests
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: run.sh
+                path: run.sh
+        - name: manifests
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: realm.yaml
+                path: realm.yaml

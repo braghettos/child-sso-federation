@@ -1,0 +1,46 @@
+# W1 — register the three CompositionDefinitions. core-provider pulls each chart
+# and generates its Composition CRD. (core.krateo.io CRD pre-exists in the child.)
+# The operator Composition CRs that instantiate these are applied by the
+# preflight-image-freshness Job AFTER the fresh core-provider has generated the
+# CRDs (child-stale-image-cache: never trust generated CRDs from a stale image).
+apiVersion: core.krateo.io/v1alpha1
+kind: CompositionDefinition
+metadata:
+  name: keycloak-operator-blueprint
+  namespace: {{ include "child-sso.namespace" . }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+  annotations:
+    krateo.io/connector-verbose: "true"
+spec:
+  chart:
+    url: {{ .Values.charts.keycloak.url | quote }}
+    version: {{ .Values.charts.keycloak.version | quote }}
+---
+apiVersion: core.krateo.io/v1alpha1
+kind: CompositionDefinition
+metadata:
+  name: keycloak-config-kog
+  namespace: {{ include "child-sso.namespace" . }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+  annotations:
+    krateo.io/connector-verbose: "true"
+spec:
+  chart:
+    url: {{ .Values.charts.keycloakConfigKog.url | quote }}
+    version: {{ .Values.charts.keycloakConfigKog.version | quote }}
+---
+apiVersion: core.krateo.io/v1alpha1
+kind: CompositionDefinition
+metadata:
+  name: openstack-keystone-operator-kog
+  namespace: {{ include "child-sso.namespace" . }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+  annotations:
+    krateo.io/connector-verbose: "true"
+spec:
+  chart:
+    url: {{ .Values.charts.keystoneKog.url | quote }}
+    version: {{ .Values.charts.keystoneKog.version | quote }}

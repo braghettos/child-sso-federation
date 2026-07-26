@@ -1,0 +1,102 @@
+{{- if .Values.mfa.enabled }}
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-mfa-bootstrap" }}
+{{- $kc := .Values.inCluster.keycloakBaseUrl }}
+{{- $realm := .Values.realm }}
+# W5 (MFA) — mfa-bootstrap: the Keycloak step-up the KOG CRDs cannot express
+# (KeycloakAuthenticationExecution.spec.config is pruned; KeycloakClient has no
+# authenticationFlowBindingOverrides). Runs the proven Admin-API flow-builders:
+#   build-flow.py   realm `krateo` browser-mfa flow (cookie ALT, loa1 CONDITIONAL
+#                   level1/max-age36000 + password, loa2 CONDITIONAL level2/max-age0
+#                   + OTP)
+#   build-client.py public `kubernetes` client (browser -> browser-mfa binding,
+#                   access.token.lifespan=300, groups mapper)
+#   build-user.py   demo user (+ password, TOTP, admin group membership)
+# Client-level binding ONLY — NEVER the realm global browserFlow (keystone/krateo-authn
+# logins stay untouched). Idempotent: each builder GET-or-(delete+recreate)s.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+{{- $runner := "set -eu\necho '[mfa-bootstrap] minting a fresh master admin token'\nexport ADMIN_TOKEN=$(python3 - <<'PY'\nimport os,json,urllib.request,urllib.parse\nbase=os.environ['KC_BASE'].rstrip('/')\ndata=urllib.parse.urlencode({'grant_type':'password','client_id':'admin-cli','username':os.environ['KC_ADMIN_USER'],'password':os.environ['KC_ADMIN_PASS']}).encode()\nr=urllib.request.urlopen(base+'/realms/master/protocol/openid-connect/token',data=data)\nprint(json.load(r)['access_token'])\nPY\n)\n[ -n \"$ADMIN_TOKEN\" ] || { echo '[mfa-bootstrap] no admin token' >&2; exit 1; }\necho '[mfa-bootstrap] building browser-mfa step-up flow'\npython3 /scripts/build-flow.py | tee /tmp/flow.out\nFID=$(grep '^BROWSER_MFA_FLOW_ID=' /tmp/flow.out | head -1 | cut -d= -f2)\n[ -n \"$FID\" ] || { echo '[mfa-bootstrap] no BROWSER_MFA_FLOW_ID' >&2; exit 1; }\nexport BROWSER_MFA_FLOW_ID=\"$FID\"\necho \"[mfa-bootstrap] flow id=$FID; building kubernetes public client (client-level binding)\"\npython3 /scripts/build-client.py\necho '[mfa-bootstrap] enrolling demo user + TOTP + admin group'\npython3 /scripts/build-user.py\necho '[mfa-bootstrap] done'\n" }}
+{{- $cmData := dict "build-flow.py" (.Files.Get "files/mfa/build-flow.py") "build-client.py" (.Files.Get "files/mfa/build-client.py") "build-user.py" (.Files.Get "files/mfa/build-user.py") "run.sh" $runner }}
+{{- $suffix := ($cmData | toYaml | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+{{- range $k, $v := $cmData }}
+  {{ $k }}: |-
+{{ $v | indent 4 }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "{ curl -fsS -o /dev/null %s/realms/master && curl -fsS -o /dev/null %s/realms/%s; }" $kc $kc $realm) "msg" "keycloak master + krateo realms reachable" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.python | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          env:
+            - name: KC_BASE
+              value: {{ $kc | quote }}
+            - name: REALM
+              value: {{ $realm | quote }}
+            - name: KC_USER
+              value: {{ .Values.mfa.demoUser | quote }}
+            - name: GROUP_NAME
+              value: {{ .Values.mfa.adminGroup | quote }}
+            - name: KC_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-initial-admin
+                  key: username
+            - name: KC_ADMIN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-initial-admin
+                  key: password
+            - name: KC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mfa-demo-cred
+                  key: KC_PASS
+            - name: TOTP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mfa-demo-cred
+                  key: TOTP_SECRET
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}
+{{- end }}

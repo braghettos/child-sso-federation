@@ -1,0 +1,87 @@
+{{- if .Values.mfa.enabled }}
+{{- $ns := include "child-sso.namespace" . }}
+{{- $group := printf "oidc:%s" .Values.mfa.adminGroup }}
+# W8 (MFA) — the step-up gate. DENY DELETE of any *.composition.krateo.io object
+# unless the caller presents a FRESH MFA step-up (acr=2). Only oidc: end-user
+# identities are gated (controllers/SAs/CDC/snowplow/portal/HS256 authn are exempt).
+# Freshness is enforced at the TOKEN layer (Keycloak loa-max-age:0 => fresh auth_time;
+# kubernetes client access.token.lifespan=300 => apiserver `exp` rejects >5m tokens) —
+# VAP CEL has no wall-clock. This VAP is a NO-OP until the child apiserver runs
+# --authentication-config (selfservice-krateo 0.2.4), so it is safe to ship now.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-mfa-stepup-delete-composition
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - composition.krateo.io
+        apiVersions:
+          - "*"
+        operations:
+          - DELETE
+        resources:
+          - "*"
+  matchConditions:
+    - name: only-oidc-users
+      expression: "has(request.userInfo.username) && request.userInfo.username.startsWith('oidc:')"
+  variables:
+    - name: acr
+      expression: "('cmp.krateo.io/acr' in request.userInfo.extra) ? request.userInfo.extra['cmp.krateo.io/acr'][0] : 'none'"
+    - name: authTime
+      expression: "('cmp.krateo.io/auth_time' in request.userInfo.extra) ? request.userInfo.extra['cmp.krateo.io/auth_time'][0] : '0'"
+  validations:
+    - expression: "variables.acr == '2'"
+      messageExpression: "'Deleting a Composition (' + request.resource.resource + ') requires a FRESH MFA step-up (acr=2). Your token has acr=' + variables.acr + ' (auth_time=' + variables.authTime + '). Re-authenticate with step-up (acr_values=2) and retry within the token freshness window.'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: require-mfa-stepup-delete-composition
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  policyName: require-mfa-stepup-delete-composition
+  validationActions:
+    - Deny
+---
+# RBAC: let the step-up admin GROUP DELETE/GET/LIST Compositions in the tenant ns.
+# NAMESPACED Role/RoleBinding only (never a ClusterRole for a tenant identity).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: composition-stepup-admin
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - composition.krateo.io
+    resources:
+      - "*"
+    verbs:
+      - get
+      - list
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: composition-stepup-admin
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: composition-stepup-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: {{ $group | quote }}
+{{- end }}

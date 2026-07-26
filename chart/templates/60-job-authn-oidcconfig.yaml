@@ -1,0 +1,119 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-authn-oidcconfig" }}
+{{- $discovery := include "child-sso.discoveryURL" . }}
+{{- $portal := include "child-sso.host.portal" . }}
+# W5 — authn-oidcconfig: OIDCConfig for "Login with Keycloak". discoveryURL is the
+# https issuer (byte-identical to Keystone's). NO `groups` scope (deferred authz).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["oidc.authn.krateo.io"]
+    resources: ["oidcconfigs"]
+    verbs: ["get", "list", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+---
+{{- $manifest := printf `apiVersion: oidc.authn.krateo.io/v1alpha1
+kind: OIDCConfig
+metadata:
+  name: keycloak
+  namespace: %[1]s
+spec:
+  clientID: krateo-authn
+  clientSecret:
+    name: krateo-authn-client
+    namespace: %[1]s
+    key: clientSecret
+  discoveryURL: "%[2]s"
+  redirectURI: "https://%[3]s/auth/oidc"
+  graphics:
+    displayName: "Login with Keycloak"
+    icon: "key"
+    backgroundColor: "#ffffff"
+    textColor: "#000000"
+` $ns $discovery $portal }}
+{{- $script := "set -eu\necho '[authn-oidcconfig] applying OIDCConfig (SSA)'\nkubectl apply --server-side --force-conflicts -f /manifests/oidcconfig.yaml\necho '[authn-oidcconfig] done'\n" }}
+{{- $suffix := (printf "%s%s" $manifest $script | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  oidcconfig.yaml: |-
+{{ $manifest | indent 4 }}
+  run.sh: |-
+{{ $script | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "{ kubectl get crd oidcconfigs.oidc.authn.krateo.io >/dev/null 2>&1 && [ -n \"$(kubectl -n %s get secret krateo-authn-client -o jsonpath='{.data.clientSecret}' 2>/dev/null)\" ]; }" $ns) "msg" "OIDCConfig CRD + krateo-authn-client populated" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.tools | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: manifests
+              mountPath: /manifests
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: run.sh
+                path: run.sh
+        - name: manifests
+          configMap:
+            name: {{ $sa }}
+            items:
+              - key: oidcconfig.yaml
+                path: oidcconfig.yaml

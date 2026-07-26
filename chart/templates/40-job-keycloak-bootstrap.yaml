@@ -1,0 +1,122 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $sa := "csso-keycloak-bootstrap" }}
+{{- $kc := .Values.inCluster.keycloakBaseUrl }}
+# W3 — keycloak-bootstrap: GET-or-create the master-realm `krateo-kog`
+# service-account client and write the webhook-labeled keycloak-kog-client Secret
+# that the config-KOG ESO uses to mint the rotating admin token. Idempotent.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+---
+{{- $script := printf `set -eu
+KC="%s"
+NS="%s"
+echo "[keycloak-bootstrap] reading operator-generated initial admin creds"
+U=$(kubectl -n "$NS" get secret keycloak-initial-admin -o jsonpath='{.data.username}' | base64 -d)
+P=$(kubectl -n "$NS" get secret keycloak-initial-admin -o jsonpath='{.data.password}' | base64 -d)
+echo "[keycloak-bootstrap] obtaining master admin token (in-cluster)"
+TOKEN=$(curl -fsS -X POST "$KC/realms/master/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=admin-cli \
+  --data-urlencode "username=$U" --data-urlencode "password=$P" | jq -r .access_token)
+[ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "no admin token" >&2; exit 1; }
+AUTH="Authorization: Bearer $TOKEN"
+echo "[keycloak-bootstrap] GET-or-create krateo-kog client (master realm)"
+CID=$(curl -fsS -H "$AUTH" "$KC/admin/realms/master/clients?clientId=krateo-kog" | jq -r '.[0].id // empty')
+if [ -z "$CID" ]; then
+  curl -fsS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+    "$KC/admin/realms/master/clients" \
+    -d '{"clientId":"krateo-kog","enabled":true,"protocol":"openid-connect","publicClient":false,"serviceAccountsEnabled":true,"standardFlowEnabled":false,"clientAuthenticatorType":"client-secret"}'
+  CID=$(curl -fsS -H "$AUTH" "$KC/admin/realms/master/clients?clientId=krateo-kog" | jq -r '.[0].id')
+fi
+echo "[keycloak-bootstrap] granting master admin role to the service account"
+SAU=$(curl -fsS -H "$AUTH" "$KC/admin/realms/master/clients/$CID/service-account-user" | jq -r .id)
+ADMINROLE=$(curl -fsS -H "$AUTH" "$KC/admin/realms/master/roles/admin")
+RID=$(echo "$ADMINROLE" | jq -r .id)
+RNAME=$(echo "$ADMINROLE" | jq -r .name)
+curl -fsS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  "$KC/admin/realms/master/users/$SAU/role-mappings/realm" \
+  -d "[{\"id\":\"$RID\",\"name\":\"$RNAME\"}]" || true
+SECRET=$(curl -fsS -H "$AUTH" "$KC/admin/realms/master/clients/$CID/client-secret" | jq -r .value)
+[ -n "$SECRET" ] && [ "$SECRET" != null ] || { echo "no client secret" >&2; exit 1; }
+echo "[keycloak-bootstrap] krateo-kog client secret length=${#SECRET}"
+kubectl -n "$NS" create secret generic keycloak-kog-client \
+  --from-literal=clientSecret="$SECRET" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n "$NS" label secret keycloak-kog-client external-secrets.io/type=webhook --overwrite
+echo "[keycloak-bootstrap] done"
+` $kc $ns }}
+{{- $suffix := ($script | sha256sum | trunc 8) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  run.sh: |-
+{{ $script | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $sa }}-{{ $suffix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: child-sso-federation
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: Never
+      initContainers:
+        {{- include "child-sso.waitloop" (dict "cmd" (printf "{ kubectl -n %s get secret keycloak-initial-admin >/dev/null 2>&1 && curl -fsS -o /dev/null %s/realms/master; }" $ns $kc) "msg" "keycloak-initial-admin secret + /realms/master 200" "root" .) | nindent 8 }}
+      containers:
+        - name: main
+          image: {{ .Values.images.tools | quote }}
+          imagePullPolicy: {{ .Values.images.toolsPullPolicy }}
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $sa }}

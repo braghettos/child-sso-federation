@@ -1,0 +1,42 @@
+{{- if .Values.mfa.enabled }}
+{{- $ns := include "child-sso.namespace" . }}
+{{- $issuer := include "child-sso.issuer" . }}
+# W8 (MFA) — the Structured AuthenticationConfiguration for the CHILD apiserver,
+# shipped as a ConfigMap resource (issuer templated per-tenant). selfservice-krateo
+# 0.2.4 mounts an equivalent ConfigMap into the vcluster apiserver via
+# --authentication-config; this copy is the authoritative per-tenant content and a
+# reference for that wiring. The apiserver validates the presented JWT (iss +
+# aud=kubernetes via the issuer JWKS) and maps claims -> k8s identity:
+#   preferred_username -> user   (prefix oidc:)
+#   groups             -> groups (prefix oidc:)
+#   acr        -> extra[cmp.krateo.io/acr]        (the VAP gate)
+#   auth_time  -> extra[cmp.krateo.io/auth_time]  (freshness signal)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apiserver-auth-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+data:
+  auth-config.yaml: |
+    apiVersion: apiserver.config.k8s.io/v1beta1
+    kind: AuthenticationConfiguration
+    jwt:
+      - issuer:
+          url: {{ $issuer }}
+          audiences:
+            - kubernetes
+        claimMappings:
+          username:
+            claim: preferred_username
+            prefix: "oidc:"
+          groups:
+            claim: groups
+            prefix: "oidc:"
+          extra:
+            - key: "cmp.krateo.io/acr"
+              valueExpression: "has(claims.acr) ? claims.acr : 'none'"
+            - key: "cmp.krateo.io/auth_time"
+              valueExpression: "has(claims.auth_time) ? string(int(claims.auth_time)) : '0'"
+{{- end }}

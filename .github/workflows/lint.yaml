@@ -1,0 +1,21 @@
+name: lint
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint (with CHART_VERSION resolved to a dummy semver)
+        run: |
+          sed -i "s/CHART_VERSION/0.0.0/g" chart/Chart.yaml
+          helm lint chart
+          helm template t chart \
+            --set baseHost=acme-krateo.krateo.dev \
+            --set demoUser=acme >/dev/null
+          echo "lint + template OK"

@@ -1,0 +1,33 @@
+# Shared cluster-scoped CRD read for EVERY csso bootstrap Job ServiceAccount.
+# The wait-loops run `kubectl get crd <X>` (cluster-scoped) — a namespaced Role
+# cannot grant that, so without this the init wait-loops hang forever until the
+# per-Job timeout. One ClusterRole (get/list/watch CRDs) + one ClusterRoleBinding
+# listing every csso Job SA (harmless if a given SA's Job is disabled).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: csso-crd-reader
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: csso-crd-reader
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: csso-crd-reader
+subjects:
+{{- $ns := include "child-sso.namespace" . }}
+{{- range $sa := list "csso-preflight" "csso-keycloak-bootstrap" "csso-realm-apply" "csso-authn-oidcconfig" "csso-openstack-instantiate" "csso-keystone-federation" "csso-bridge-tenant-cred" "csso-keystone-fernet" "csso-mfa-bootstrap" }}
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+{{- end }}
