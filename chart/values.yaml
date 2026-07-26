@@ -33,7 +33,14 @@ keystoneImage: "ghcr.io/braghettos/keystone-oidc:2025.1-ubuntu_jammy"
 # The portal (basic-auth) username the token-bridge maps to the demo tenant.
 # Its Keystone user + sso-bridge-<demoUser>.json cred file are provisioned by the
 # bridge-tenant-cred Job. Leave empty to skip bridge tenant-cred provisioning.
+# A matching krateo-auth-basic User is created (07-basic-user.yaml) so the child-portal
+# login identity == the bridge tenant mapping.
 demoUser: ""
+
+# Password for the demoUser's krateo-auth-basic login. Empty -> a stable random one is
+# generated and lookup-preserved in Secret <demoUser>-password (read it from there for
+# programmatic login). Set it only if you need a known password.
+demoUserPassword: ""
 
 openstack:
   profile: identity      # identity = MariaDB+Memcached+Keystone+Glance+Horizon

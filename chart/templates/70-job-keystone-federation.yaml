@@ -31,6 +31,12 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "update", "patch"]
+  # 0.1.2: the wait-loop checks `kubectl get deploy keystone-api ... | grep keystone-oidc`
+  # (asserts the OIDC image is live). Without deployment read the `&&` short-circuits and
+  # the gate loops forever even when keystone is healthy on the OIDC image.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -1,0 +1,49 @@
+{{- if .Values.demoUser }}
+{{- $ns := include "child-sso.namespace" . }}
+{{- $user := .Values.demoUser }}
+{{- $secretName := printf "%s-password" $user }}
+{{/* 07 — a krateo-auth-basic User matching demoUser, so the child-portal login
+     identity EQUALS the token-bridge tenant mapping. The bridge maps the caller's
+     Krateo JWT `username` -> TENANT_CRED_DIR/<username>.json, and bridge-tenant-cred
+     writes the cred file keyed on demoUser (sso-bridge-<demoUser>). Without a login
+     user == demoUser, the only basic users are the installer defaults (admin/cyberjoker)
+     and the bridge 403s ("no tenant mapping"). The User CRD comes from krateo-auth-basic
+     (installer catalog); child-sso-federation runs after the installer so it exists.
+     Password is lookup-preserved: reuse the live Secret if present, else demoUserPassword
+     or a generated one -> byte-stable across re-renders. Read it from Secret
+     <demoUser>-password for programmatic login. */}}
+{{- $existing := (lookup "v1" "Secret" $ns $secretName) }}
+{{- $pw := "" }}
+{{- if and $existing $existing.data (hasKey $existing.data "password") }}
+{{-   $pw = index $existing.data "password" | b64dec }}
+{{- else }}
+{{-   $pw = .Values.demoUserPassword | default (randAlphaNum 20) }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+type: kubernetes.io/basic-auth
+stringData:
+  password: {{ $pw | quote }}
+---
+apiVersion: basic.authn.krateo.io/v1alpha1
+kind: User
+metadata:
+  name: {{ $user }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  displayName: {{ $user | title }}
+  groups:
+    - admins
+    - devs
+  passwordRef:
+    key: password
+    name: {{ $secretName }}
+    namespace: {{ $ns }}
+{{- end }}

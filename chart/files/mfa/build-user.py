@@ -35,11 +35,12 @@ if not uid:
     uid=loc.rstrip("/").split("/")[-1]
 print("user id:",uid)
 
-# --- password (non-temporary) ---
-s,b,_=call("PUT",f"/users/{uid}/reset-password",{"type":"password","value":PW,"temporary":False})
-print(f"set password -> {s}")
-
-# --- OTP credential (raw secret, HmacSHA1/6/30 to match totp.py) ---
+# --- OTP credential FIRST (raw secret, HmacSHA1/6/30 to match totp.py).
+#     0.1.2 fix: a PUT /users/{id} with `credentials:[...]` REPLACES the whole credential
+#     array, so enrolling OTP this way WIPES any password. Do OTP first, then set the
+#     password via the dedicated reset-password endpoint (which ADDS a password without
+#     touching OTP) LAST — so both survive and unattended login works. Also clear
+#     requiredActions so no pending CONFIGURE_TOTP/UPDATE_PASSWORD blocks direct login. ---
 cred={"type":"otp","userLabel":"stepup-totp",
       "secretData":json.dumps({"value":TOTP}),
       "credentialData":json.dumps({"subType":"totp","digits":6,"period":30,"algorithm":"HmacSHA1"})}
@@ -48,8 +49,13 @@ s,creds,_=call("GET",f"/users/{uid}/credentials")
 if isinstance(creds,list):
     for c in creds:
         if c["type"]=="otp": call("DELETE",f"/users/{uid}/credentials/{c['id']}")
-s,b,_=call("PUT",f"/users/{uid}",{"credentials":[cred]})
+s,b,_=call("PUT",f"/users/{uid}",{"credentials":[cred],"requiredActions":[]})
 print(f"enrol OTP -> {s}")
+
+# --- password LAST (authoritative from KC_PASS; reset-password ADDS a password
+#     credential without removing the OTP) ---
+s,b,_=call("PUT",f"/users/{uid}/reset-password",{"type":"password","value":PW,"temporary":False})
+print(f"set password -> {s}")
 
 # --- group membership ---
 s,b,_=call("PUT",f"/users/{uid}/groups/{gid}")

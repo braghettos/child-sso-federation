@@ -24,6 +24,12 @@ rules:
   - apiGroups: ["oidc.authn.krateo.io"]
     resources: ["oidcconfigs"]
     verbs: ["get", "list", "create", "patch", "update"]
+  # 0.1.2: the wait-loop gates on `[ -n "$(kubectl get secret krateo-authn-client
+  # -o jsonpath={.data.clientSecret})" ]`. Without secret read the check returns empty
+  # (forbidden) and the gate loops forever even though the secret is populated.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
