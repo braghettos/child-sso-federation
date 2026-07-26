@@ -81,7 +81,10 @@ PID=$(curl -fsS -H "$AUTH" "$KS/projects?name=$PROJECT&domain_id=$DID" | jq -r '
 RID=$(curl -fsS -H "$AUTH" "$KS/roles?name=member" | jq -r '.roles[0].id // empty')
 [ -n "$RID" ] || { echo "role member not found" >&2; exit 1; }
 NEWPASS=$(tr -dc a-f0-9 </dev/urandom | head -c 40)
-UID=$(curl -fsS -H "$AUTH" "$KS/users?name=$KS_USER" | jq -r '.users[0].id // empty')
+# 0.1.6: scope the user lookup by domain_id. Without it the admin token doesn't see the
+# user in the keycloak domain -> GET returns empty -> the create POST 409s on re-run
+# ("user create failed"). (Same create-only-409 idempotency class as mapping/flow.)
+UID=$(curl -fsS -H "$AUTH" "$KS/users?name=$KS_USER&domain_id=$DID" | jq -r '.users[0].id // empty')
 if [ -z "$UID" ]; then
   UID=$(curl -fsS -H "$AUTH" -H 'Content-Type: application/json' -X POST "$KS/users" -d '{"user":{"name":"'"$KS_USER"'","domain_id":"'"$DID"'","password":"'"$NEWPASS"'","enabled":true}}' | jq -r .user.id)
 else
