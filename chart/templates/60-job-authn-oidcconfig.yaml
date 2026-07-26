@@ -90,7 +90,6 @@ metadata:
     {{- include "child-sso.labels" . | nindent 4 }}
 spec:
   backoffLimit: 10
-  ttlSecondsAfterFinished: 900
   template:
     metadata:
       labels:
