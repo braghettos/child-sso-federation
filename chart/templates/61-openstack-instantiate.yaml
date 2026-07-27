@@ -1,0 +1,36 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $keycloak := include "child-sso.host.keycloak" . }}
+{{- $keystone := include "child-sso.host.keystone" . }}
+{{- $horizon := include "child-sso.host.horizon" . }}
+{{- $ksSecret := include "child-sso.keystoneClientSecret" . }}
+{{- $crypto := include "child-sso.oidcCryptoPassphrase" . }}
+{{- $cr := .Files.Get "files/openstack-cr.yaml" }}
+{{- $cr = $cr | replace "__APIVERSION__" .Values.compositionApiVersions.openstack }}
+{{- $cr = $cr | replace "__NAMESPACE__" $ns }}
+{{- $cr = $cr | replace "__PROFILE__" .Values.openstack.profile }}
+{{- $cr = $cr | replace "__KEYSTONE_IMAGE__" .Values.keystoneImage }}
+{{- $cr = $cr | replace "__REALM__" .Values.realm }}
+{{- $cr = $cr | replace "__KEYCLOAK_HOST__" $keycloak }}
+{{- $cr = $cr | replace "__KEYSTONE_HOST__" $keystone }}
+{{- $cr = $cr | replace "__HORIZON_HOST__" $horizon }}
+{{- $cr = $cr | replace "__KEYSTONE_CLIENT_SECRET__" $ksSecret }}
+{{- $cr = $cr | replace "__OIDC_CRYPTO_PASSPHRASE__" $crypto }}
+{{/*
+W5 — openstack-instantiate (0.2.0 JOBLESS): emit the Openstack CR with FINAL
+federation componentValues directly, instead of an apply-Job. This one is
+fernet/umbrella-SENSITIVE — the componentValues must be applied ONCE and NEVER
+re-patched (re-patching while keystone is transiently not-Ready re-triggers the
+umbrella Horizon-prune + fernet churn — see [[keystone-fernet-wipe-on-cdc-resync]]).
+
+So the guard is CREATE-ONCE (not-exists), and the CR carries
+`helm.sh/resource-policy: keep` (in files/openstack-cr.yaml): once created the guard
+goes false and the manifest is no longer rendered, but Helm/CDC KEEP the CR (upgrade
++ uninstall) rather than pruning it. Result: created once, never re-patched, never
+pruned — the exact original Job semantic, jobless. Gate on the openstacks CRD too so
+the create is only attempted once the composition CRD exists (CDC retries until then).
+*/}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "openstacks.composition.krateo.io" }}
+{{- $exists := lookup .Values.compositionApiVersions.openstack "Openstack" $ns "openstack" }}
+{{- if and $crd (not $exists) }}
+{{ $cr }}
+{{- end }}
