@@ -42,6 +42,14 @@ demoUser: ""
 # programmatic login). Set it only if you need a known password.
 demoUserPassword: ""
 
+# Epic #1 (jobless refactor), slice 1: emit Keystone federation as KOG CRs
+# (70-keystone-federation-crs.yaml) instead of the imperative Job
+# (70-job-keystone-federation.yaml). The two are mutually exclusive.
+# `lookup` is nil under `helm template`, so this path MUST be validated live on a
+# throwaway tenant before it becomes the default.
+federation:
+  declarative: false
+
 openstack:
   profile: identity      # identity = MariaDB+Memcached+Keystone+Glance+Horizon
   domain: keycloak       # federation domain (NB: "federated" is reserved by Keystone)
