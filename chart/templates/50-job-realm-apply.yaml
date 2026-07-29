@@ -144,6 +144,9 @@ NS="%s"
 REALM="%s"
 echo "[realm-apply] applying Configuration + Realm + mapper-less Clients (SSA)"
 kubectl apply --server-side --force-conflicts -f /manifests/realm.yaml
+# Epic #1: when the ESO path is on (51-authn-client-secret-eso.yaml), the realm apply
+# above is all this Job does; the client-secret read-back below belongs to ESO.
+[ "%s" = "true" ] && { echo "[realm-apply] client-secret read-back handled by ESO"; exit 0; }
 echo "[realm-apply] waiting for krateo-authn client to reconcile into the realm"
 TOKEN=""
 for i in $(seq 1 60); do
@@ -161,7 +164,7 @@ echo "[realm-apply] krateo-authn client secret length=${#CS}"
 kubectl -n "$NS" create secret generic krateo-authn-client \
   --from-literal=clientSecret="$CS" --dry-run=client -o yaml | kubectl apply -f -
 echo "[realm-apply] done"
-` $kc $ns $realm }}
+` $kc $ns $realm ($.Values.federation.declarativeAuthnSecret | default false | toString) }}
 {{- $suffix := (printf "%s%s" $manifests $script | sha256sum | trunc 8) }}
 apiVersion: v1
 kind: ConfigMap
