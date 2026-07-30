@@ -1,0 +1,46 @@
+{{- $ns := include "child-sso.namespace" . }}
+{{- $discovery := include "child-sso.discoveryURL" . }}
+{{- $portal := include "child-sso.host.portal" . }}
+{{/*
+W5 — authn-oidcconfig (0.2.0 JOBLESS): the OIDCConfig for "Login with Keycloak",
+emitted DIRECTLY as a lookup-guarded manifest instead of an apply-Job with an
+init-container wait-loop. The CDC re-renders every reconcile, so the CDC IS the
+retry engine — no Job, no SA/Role/RoleBinding, no TTL, no wait-loop RBAC.
+
+Ordering guard: render only once the OIDCConfig CRD exists AND the ESO-populated
+krateo-authn-client secret has a clientSecret. On earlier reconciles the lookups
+are empty -> the manifest is simply not emitted (no error); a later reconcile
+emits + applies it. (NB: `lookup` returns nil under `helm template`, so this
+block is INVISIBLE to CI `helm template` — it only materialises against a live
+cluster during CDC reconcile. Verify live, not via dry-run.)
+
+Write-once-persist: also render if the OIDCConfig ALREADY exists, so a transient
+dep-flap (secret briefly absent) does NOT retract the guard and let Helm PRUNE a
+working OIDCConfig. Guard on a STABLE/monotonic signal + self-existence.
+*/}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "oidcconfigs.oidc.authn.krateo.io" }}
+{{- $sec := lookup "v1" "Secret" $ns "krateo-authn-client" }}
+{{- $ready := and $crd $sec (dig "data" "clientSecret" "" (default (dict) $sec)) }}
+{{- $exists := lookup "oidc.authn.krateo.io/v1alpha1" "OIDCConfig" $ns "keycloak" }}
+{{- if or $exists $ready }}
+apiVersion: oidc.authn.krateo.io/v1alpha1
+kind: OIDCConfig
+metadata:
+  name: keycloak
+  namespace: {{ $ns }}
+  labels:
+    {{- include "child-sso.labels" . | nindent 4 }}
+spec:
+  clientID: krateo-authn
+  clientSecret:
+    name: krateo-authn-client
+    namespace: {{ $ns }}
+    key: clientSecret
+  discoveryURL: {{ $discovery | quote }}
+  redirectURI: "https://{{ $portal }}/auth/oidc"
+  graphics:
+    displayName: "Login with Keycloak"
+    icon: "key"
+    backgroundColor: "#ffffff"
+    textColor: "#000000"
+{{- end }}

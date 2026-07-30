@@ -7,6 +7,12 @@ kind: Openstack
 metadata:
   name: openstack
   namespace: __NAMESPACE__
+  annotations:
+    # 0.2.0 write-once: created ONCE by the lookup-guarded manifest (guard = not-exists),
+    # then the guard goes false and the manifest is no longer rendered — resource-policy:keep
+    # makes Helm/CDC KEEP it (never prune, never re-patch). This preserves the original
+    # "apply once, never re-patch" fernet/umbrella-safe semantics without a Job.
+    helm.sh/resource-policy: keep
 spec:
   profile: __PROFILE__
   componentValues:

@@ -1,0 +1,149 @@
+{{/*
+70 — Keystone federation, DECLARATIVE (epic #1, M2: KOG CRs)
+
+Replaces 70-job-keystone-federation.yaml. That Job hand-rolled GET-then-PATCH-else-PUT
+around four Keystone calls to stay idempotent; that dance IS a reconcile loop, so it is
+expressed here as CRs reconciled by rest-dynamic-controller instead.
+
+Why no alias->id lookup is needed (rest-dynamic-controller#30, deferred): all three
+federation objects are addressed by a USER-CHOSEN id in the path —
+  /OS-FEDERATION/identity_providers/keycloak
+  /OS-FEDERATION/mappings/keycloak_mapping
+  /OS-FEDERATION/identity_providers/keycloak/protocols/openid
+so nothing here depends on a server-generated identifier except the IdP's domain_id,
+which is handled by the M1 lookup-guard below.
+
+Ordering guard (M1): render only once the KOG CRDs exist AND the federation domain has
+a server-assigned id to bind the IdP to. `lookup` returns nil under `helm template`, so
+this MUST be validated live on a throwaway tenant — never the demo child.
+*/}}
+{{- if .Values.federation.declarative | default false }}
+{{- $ns := .Release.Namespace }}
+{{- $grp := "identity.openstack.krateo.io" }}
+{{- $ver := "v1alpha1" }}
+{{- $domain := .Values.openstack.domain }}
+{{- $project := .Values.openstack.demoProject }}
+{{- $idp := "keycloak" }}
+{{- $mapping := "keycloak_mapping" }}
+{{- $protocol := "openid" }}
+
+{{/* CRDs must exist before we emit any CR (the KOG is a sibling CompositionDefinition). */}}
+{{- $crdIdp := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "identityfederationproviders.identity.openstack.krateo.io" }}
+{{- $crdMap := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "identitymappings.identity.openstack.krateo.io" }}
+{{- $crdPro := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "identityfederationprotocols.identity.openstack.krateo.io" }}
+{{- $crdDom := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "identitydomains.identity.openstack.krateo.io" }}
+{{- $kogReady := and $crdIdp $crdMap $crdPro $crdDom }}
+
+{{- if $kogReady }}
+---
+{{/*
+Federation domain. Keystone assigns its id on create; the IdP below binds to that id,
+which is the one value here that cannot be known at render time.
+*/}}
+apiVersion: {{ $grp }}/{{ $ver }}
+kind: IdentityDomain
+metadata:
+  name: {{ $domain }}
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  configurationRef:
+    name: keystone-admin
+  name: {{ $domain }}
+  description: "Federation domain for the Keycloak OIDC identity provider"
+  enabled: true
+---
+apiVersion: {{ $grp }}/{{ $ver }}
+kind: IdentityProject
+metadata:
+  name: {{ $project }}
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  configurationRef:
+    name: keystone-admin
+  name: {{ $project }}
+  description: "JIT auto-provisioned project for federated users"
+  enabled: true
+---
+{{/*
+Mapping and protocol carry no server-generated references, so they are emitted as soon
+as the CRDs exist. The mapping rules are the same document the Job shipped as
+mapping.json — kept verbatim so behaviour is unchanged by this refactor.
+*/}}
+apiVersion: {{ $grp }}/{{ $ver }}
+kind: IdentityMapping
+metadata:
+  name: {{ $mapping }}
+  namespace: {{ $ns }}
+spec:
+  configurationRef:
+    name: keystone-admin
+  id: {{ $mapping }}
+  {{/* Same rules the Job shipped as mapping.json; {0}/{1} are Keystone's remote-claim
+       substitutions (index into `remote` below), NOT Helm placeholders. */}}
+  rules:
+    - local:
+        - user:
+            name: "{0}"
+            email: "{1}"
+            domain:
+              name: {{ $domain }}
+        - projects:
+            - name: {{ $project }}
+              roles:
+                - name: member
+      remote:
+        - type: OIDC-preferred_username
+        - type: OIDC-email
+{{- end }}
+
+{{- if $kogReady }}
+{{/*
+IdP: guarded on the domain CR having reported its id. On earlier reconciles this lookup
+is empty, nothing is emitted, and the CDC re-renders until it resolves. Also rendered if
+the IdP already exists, so a transient empty lookup cannot prune a live IdP.
+*/}}
+{{- $domCR := lookup (printf "%s/%s" $grp $ver) "IdentityDomain" $ns $domain }}
+{{- $domId := "" }}
+{{- if $domCR }}{{ $domId = (dig "status" "id" "" $domCR) }}{{- end }}
+{{- $idpExists := lookup (printf "%s/%s" $grp $ver) "IdentityFederationProvider" $ns $idp }}
+{{- if or $idpExists $domId }}
+---
+apiVersion: {{ $grp }}/{{ $ver }}
+kind: IdentityFederationProvider
+metadata:
+  name: {{ $idp }}
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  configurationRef:
+    name: keystone-admin
+  id: {{ $idp }}
+  enabled: true
+  description: "Keycloak (krateo realm) OIDC identity provider"
+  domain_id: {{ $domId | quote }}
+  remote_ids:
+    - {{ include "child-sso.issuer" . | quote }}
+---
+{{/*
+Protocol binds IdP -> mapping. Both ids are user-chosen, but it is emitted only after the
+IdP exists: Keystone rejects a protocol whose parent IdP is absent.
+*/}}
+apiVersion: {{ $grp }}/{{ $ver }}
+kind: IdentityFederationProtocol
+metadata:
+  name: {{ printf "%s-%s" $idp $protocol }}
+  namespace: {{ $ns }}
+spec:
+  configurationRef:
+    name: keystone-admin
+  id: {{ $protocol }}
+  idp_id: {{ $idp }}
+  mapping_id: {{ $mapping }}
+{{- end }}
+{{- end }}
+{{- end }}

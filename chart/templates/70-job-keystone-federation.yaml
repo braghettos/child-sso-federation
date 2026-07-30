@@ -1,3 +1,4 @@
+{{- if not (.Values.federation.declarative | default false) }}
 {{- $ns := include "child-sso.namespace" . }}
 {{- $sa := "csso-keystone-federation" }}
 {{- $ks := .Values.inCluster.keystoneAuthUrl }}
@@ -179,3 +180,4 @@ spec:
             items:
               - key: mapping.json
                 path: mapping.json
+{{- end }}
